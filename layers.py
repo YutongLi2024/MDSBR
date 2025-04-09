@@ -1,0 +1,297 @@
+from numpy.lib.function_base import _DIMENSION_NAME
+import torch
+import torch.nn as nn
+from torch.nn import Parameter
+import torch.nn.functional as F
+import numpy
+import math
+
+
+def trans_to_cuda(variable):
+    if torch.cuda.is_available():
+        return variable.cuda()
+    else:
+        return variable
+
+
+def trans_to_cpu(variable):
+    if torch.cuda.is_available():
+        return variable.cpu()
+    else:
+        return variable
+    
+    
+class DisentangleGraph(nn.Module):
+    def __init__(self, dim, alpha, e=0.3, t=10.0):
+        super(DisentangleGraph, self).__init__()
+        # Disentangling Hypergraph with given H and latent_feature
+        self.latent_dim = dim   # Disentangled feature dim
+        self.e = e              # sparsity parameters
+        self.t = t              
+        self.w = nn.Parameter(torch.Tensor(self.latent_dim, self.latent_dim))
+        self.w1 = nn.Parameter(torch.Tensor(self.latent_dim, 1))
+
+        self.leakyrelu = nn.LeakyReLU(alpha)
+
+    def forward(self, hidden, H, int_emb, mask):
+        """
+        Input: intent-aware hidden:(Batchsize, N, dim), incidence matrix H:(batchsize, N, num_edge), intention_emb: (num_factor, dim), node mask:(batchsize, N)
+        Output: Distangeled incidence matrix
+        """
+        node_num = torch.sum(mask, dim=1, keepdim=True).unsqueeze(-1) # (batchsize, 1, 1)
+        select_k = self.e * node_num
+        select_k = select_k.floor() 
+
+        mask = mask.float().unsqueeze(-1) # (batchsize, N, 1)
+        h = hidden
+        batch_size = h.shape[0]
+        N = H.shape[1]
+        k = int_emb.shape[0]
+
+        select_k = select_k.repeat(1, N, k)
+
+          
+        int_emb =  int_emb.unsqueeze(0).repeat(batch_size, 1, 1) # (batchsize, num_factor, latent_dim)
+        int_emb =  int_emb.unsqueeze(1).repeat(1, N, 1, 1)       # (batchsize, N, num_factor, latent_dim)
+
+        hs = h.unsqueeze(2).repeat(1, 1, k, 1)                   # (batchsize, N, num_factor, latent_dim)
+
+        # CosineSimilarity 
+        cos = nn.CosineSimilarity(dim=-1)
+        sim_val = self.t * cos(hs, int_emb)                      # (batchsize, Node, Num_edge)
+        
+        
+        sim_val = sim_val * mask
+        
+        # sort
+        _, indices = torch.sort(sim_val, dim=1, descending=True)
+        _, idx = torch.sort(indices, dim=1)
+
+        # select according to <=0
+        judge_vec = idx - select_k  
+        ones_vec = 3*torch.ones_like(sim_val)
+        zeros_vec = torch.zeros_like(sim_val)
+        
+        # intent hyperedges
+        int_H = torch.where(judge_vec <= 0, ones_vec, zeros_vec)
+        # add intent hyperedge
+        H_out = torch.cat([int_H, H], dim=-1) # (batchsize, N, num_edge+1) 
+        # return learned binary value
+        return H_out
+
+
+class LocalHyperGATlayer(nn.Module):
+    def __init__(self, dim, layer, alpha, bias=False, act=True):
+        super(LocalHyperGATlayer, self).__init__()
+        self.dim = dim
+        self.layer = layer
+        self.alpha = alpha
+
+        # Parameters 
+        # node->edge->node
+        self.w1 = Parameter(torch.Tensor(self.dim, self.dim))
+        self.w2 = Parameter(torch.Tensor(self.dim, self.dim))
+  
+        self.a10 = nn.Parameter(torch.Tensor(size=(self.dim, 1)))   
+        self.a11 = nn.Parameter(torch.Tensor(size=(self.dim, 1)))   
+        self.a12 = nn.Parameter(torch.Tensor(size=(self.dim, 1)))    
+        self.a20 = nn.Parameter(torch.Tensor(size=(self.dim, 1))) 
+        self.a21 = nn.Parameter(torch.Tensor(size=(self.dim, 1)))     
+        self.a22 = nn.Parameter(torch.Tensor(size=(self.dim, 1)))  
+        
+        self.leakyrelu = nn.LeakyReLU(self.alpha)
+
+
+    def forward(self, hidden, H, s_c):
+        """
+        Input: hidden:(Batchsize, N, latent_dim), incidence matrix H:(batchsize, N, num_edge), session cluster s_c:(Batchsize, 1, latent_dim)
+        Output: updated hidden:(Batchsize, N, latent_dim)
+        """
+
+        batch_size = hidden.shape[0]
+        N = H.shape[1]            # node num
+        edge_num = H.shape[2]     # edge num
+        H_adj = torch.ones_like(H)
+        mask = torch.zeros_like(H)
+        H_adj = torch.where(H>0, H_adj, mask)
+        s_c = s_c.expand(-1, N, -1)
+        h_emb = hidden
+        h_embs = []
+
+        for i in range(self.layer):
+            edge_cluster = torch.matmul(H_adj.transpose(1,2), h_emb)                  # (Batchsize, edge_num, latent_dim)
+            h_t_cluster = h_emb + s_c
+            
+            # node2edge
+            edge_c_in = edge_cluster.unsqueeze(1).expand(-1, N, -1, -1)               # (Batchsize, N, edge_num, latent_dim)
+            h_4att0 = h_emb.unsqueeze(2).expand(-1, -1, edge_num, -1)                 # (Batchsize, N, edge_num, latent_dim)
+
+            feat = edge_c_in * h_4att0
+
+            atts10 = self.leakyrelu(torch.matmul(feat, self.a10).squeeze(-1))         # (Batchsize, N, edge_num)
+            atts11 = self.leakyrelu(torch.matmul(feat, self.a11).squeeze(-1))         # (Batchsize, N, edge_num)
+            atts12 = self.leakyrelu(torch.matmul(feat, self.a12).squeeze(-1))         # (Batchsize, N, edge_num)
+            
+            zero_vec = -9e15*torch.ones_like(H)
+            alpha1 = torch.where(H.eq(1), atts10, zero_vec)
+            alpha1 = torch.where(H.eq(2), atts11, alpha1)
+            alpha1 = torch.where(H.eq(3), atts12, alpha1)
+
+            alpha1 = F.softmax(alpha1, dim=1)                                         # (Batchsize, N, edge_num)
+
+            edge = torch.matmul(alpha1.transpose(1,2), h_emb)                         # (Batchsize, edge_num, latent_dim)
+
+            # edge2node
+            edge_in = edge.unsqueeze(1).expand(-1, N, -1, -1)                         # (Batchsize, N, edge_num, latent_dim)
+            h_4att1 = h_t_cluster.unsqueeze(2).expand(-1, -1, edge_num, -1)           # (Batchsize, N, edge_num, latent_dim)
+            
+            feat_e2n = edge_in * h_4att1
+            
+            atts20 = self.leakyrelu(torch.matmul(feat_e2n, self.a20).squeeze(-1))     # (Batchsize, N, edge_num)
+            atts21 = self.leakyrelu(torch.matmul(feat_e2n, self.a21).squeeze(-1))     # (Batchsize, N, edge_num)
+            atts22 = self.leakyrelu(torch.matmul(feat_e2n, self.a22).squeeze(-1))     # (Batchsize, N, edge_num)
+            
+
+            alpha2 = torch.where(H.eq(1), atts20, zero_vec)
+            alpha2 = torch.where(H.eq(2), atts21, alpha2)
+            alpha2 = torch.where(H.eq(3), atts22, alpha2)
+            
+            alpha2 = F.softmax(alpha2, dim=2)                                         # (Batchsize, N, edge_num)
+
+            h_emb = torch.matmul(alpha2, edge)                                        # (Batchsize, N, latent_dim)
+            h_embs.append(h_emb)
+
+        h_embs = torch.stack(h_embs, dim=1)
+        h_out = torch.sum(h_embs, dim=1)
+
+        return h_out
+
+
+class SimpleGATLayer(nn.Module):
+    def __init__(self, dim, layer, alpha, bias=False, act=True):
+        super(SimpleGATLayer, self).__init__()
+        self.dim = dim
+        self.layer = layer
+        self.alpha = alpha
+
+        self.W = nn.Parameter(torch.Tensor(self.dim, self.dim))
+        self.a = nn.Parameter(torch.Tensor(self.dim * 2, 1))
+        
+        self.leakyrelu = nn.LeakyReLU(self.alpha)
+
+    def forward(self, hidden, Hs, s_c):
+        batch_size, N, num_edge = Hs.shape
+        
+        adj = torch.matmul(Hs, Hs.transpose(1, 2))
+        adj = (adj > 0).float()  
+
+        s_c = s_c.expand(-1, N, -1)
+        h_emb = hidden
+        h_embs = []
+
+        for _ in range(self.layer):
+            Wh = torch.matmul(h_emb, self.W)
+            
+            a_input = self._prepare_attentional_mechanism_input(Wh)
+            e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(3))
+            
+            zero_vec = -9e15 * torch.ones_like(e)
+            attention = torch.where(adj > 0, e, zero_vec)
+            
+            attention = F.softmax(attention, dim=2)
+            
+            h_prime = torch.matmul(attention, Wh)
+            
+            h_emb = h_prime + s_c
+            h_embs.append(h_emb)
+
+        h_embs = torch.stack(h_embs, dim=1)
+        h_out = torch.sum(h_embs, dim=1)
+
+        return h_out
+
+    def _prepare_attentional_mechanism_input(self, Wh):
+        B, N, E = Wh.shape
+        Wh_repeated_in_chunks = Wh.repeat_interleave(N, dim=1)
+        Wh_repeated_alternating = Wh.repeat(1, N, 1)
+        all_combinations_matrix = torch.cat([Wh_repeated_in_chunks, Wh_repeated_alternating], dim=2)
+        return all_combinations_matrix.view(B, N, N, 2 * E)
+
+
+class SimpleGATLayer1(nn.Module):
+    def __init__(self, dim, layer, alpha, bias=False, act=True):
+        super(SimpleGATLayer1, self).__init__()
+        self.dim = dim
+        self.layer = int(layer)
+        self.alpha = alpha
+
+        self.W = nn.Parameter(torch.Tensor(self.dim, self.dim))
+        self.a = nn.Parameter(torch.Tensor(self.dim * 2, 1))
+        
+        self.leakyrelu = nn.LeakyReLU(self.alpha)
+
+    def forward(self, hidden, Hs, s_c):
+        batch_size, N, num_edge = Hs.shape
+        
+        print(f"Input shapes - hidden: {hidden.shape}, Hs: {Hs.shape}, s_c: {s_c.shape}")
+        # Input shapes - hidden: torch.Size([64, 19, 200]), Hs: torch.Size([64, 19, 162]), s_c: torch.Size([64, 1, 200])
+
+        adj = torch.matmul(Hs, Hs.transpose(1, 2))
+        adj = (adj > 0).float()
+        print(f"Adjacency matrix shape: {adj.shape}")# (64,19,19)
+
+
+        s_c = s_c.expand(-1, N, -1)
+        print(f"Expanded s_c shape: {s_c.shape}") #(64,19,200)
+
+        h_emb = hidden
+        h_embs = []
+
+        for i in range(self.layer):
+            Wh = torch.matmul(h_emb, self.W)
+            print(f"Layer {i+1} - Wh shape: {Wh.shape}") #(64,19,200)
+            
+            a_input = self._prepare_attentional_mechanism_input(Wh)
+            print(f"Layer {i+1} - a_input shape: {a_input.shape}") # (64,19,19,400)
+            
+            e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(3)) 
+            print(f"Layer {i+1} - e shape: {e.shape}")# (64,19,19)
+            
+            attention = F.softmax(torch.where(adj > 0, e, -9e15 * torch.ones_like(e)), dim=2)
+            print(f"Layer {i+1} - attention shape: {attention.shape}") # (64,19,19)
+            
+            h_prime = torch.matmul(attention, Wh)
+            print(f"Layer {i+1} - h_prime shape: {h_prime.shape}") # (64,19,200)
+            
+            h_emb = h_prime + s_c
+            print(f"Layer {i+1} - h_emb shape: {h_emb.shape}") # (64,19,200)
+            h_embs.append(h_emb)
+
+        h_embs = torch.stack(h_embs, dim=1)
+        print(f"Stacked h_embs shape: {h_embs.shape}") # (64,1,19,200)
+        
+        h_out = torch.sum(h_embs, dim=1)
+        print(f"Final h_out shape: {h_out.shape}") # (64,19,200)
+
+        return h_out
+
+    def _prepare_attentional_mechanism_input(self, Wh):
+        B, N, E = Wh.shape
+        print(f"Input Wh shape: {Wh.shape}") #(64,19,200)
+
+        Wh_repeated_in_chunks = Wh.repeat_interleave(N, dim=1)
+        print(f"Wh_repeated_in_chunks shape: {Wh_repeated_in_chunks.shape}") #(64,361,200)
+
+        Wh_repeated_alternating = Wh.repeat(1, N, 1)
+        print(f"Wh_repeated_alternating shape: {Wh_repeated_alternating.shape}") #(64,361,200)
+
+        all_combinations_matrix = torch.cat([Wh_repeated_in_chunks, Wh_repeated_alternating], dim=2)
+        print(f"all_combinations_matrix shape: {all_combinations_matrix.shape}") #(64,361,200)
+
+        result = all_combinations_matrix.view(B, N, N, 2 * E)
+        print(f"Final result shape: {result.shape}") #(64,19,19,400)
+
+        return result
+
+
+
